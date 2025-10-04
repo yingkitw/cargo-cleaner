@@ -128,7 +128,15 @@ detect_workspace_issues() {
 # Function to clean workspace projects with special handling
 clean_workspace_project() {
     local project_dir="$1"
+    local bytes_freed_var="$2"
     print_info "Cleaning workspace project in: $project_dir"
+
+    # Calculate size before cleaning
+    local target_size_before=0
+    if [ -d "$project_dir/target" ]; then
+        target_size_before=$(get_directory_size_bytes "$project_dir/target")
+        [ -z "$target_size_before" ] && target_size_before=0
+    fi
     
     if cd "$project_dir"; then
         # For workspace projects, try to clean from the root first
@@ -152,7 +160,7 @@ clean_workspace_project() {
                             print_info "Cleaning existing workspace member: $member"
                             
                             # Try to clean the member, but handle dependency issues gracefully
-                            if clean_cargo_project "$member_path"; then
+                            if clean_cargo_project "$member_path" "bytes_freed_var"; then
                                 ((member_cleaned++))
                             else
                                 print_warning "Failed to clean workspace member: $member"
@@ -187,8 +195,12 @@ clean_workspace_project() {
                 # If no members could be cleaned, try direct target removal
                 if [ -d "target" ]; then
                     print_info "Removing workspace target directory directly..."
+                    local workspace_target_size=$(get_directory_size_bytes "target")
+                    [ -z "$workspace_target_size" ] && workspace_target_size=0
                     if rm -rf target; then
-                        print_success "Successfully removed workspace target directory: $project_dir"
+                        eval "$bytes_freed_var=\$((\$$bytes_freed_var + workspace_target_size))"
+                        local freed_human=$(format_bytes "$workspace_target_size")
+                        print_success "Successfully removed workspace target directory: $project_dir (freed: $freed_human)"
                         return 0
                     fi
                 fi
@@ -201,7 +213,17 @@ clean_workspace_project() {
             
             # Try to clean the entire workspace
             if cargo clean --workspace 2>/dev/null; then
-                print_success "Successfully cleaned workspace: $project_dir"
+                local target_size_after=0
+                if [ -d "target" ]; then
+                    target_size_after=$(du -sb "target" 2>/dev/null | cut -f1)
+                    [ -z "$target_size_after" ] && target_size_after=0
+                fi
+                local freed=$((target_size_before - target_size_after))
+                eval "$bytes_freed_var=\$((\$$bytes_freed_var + freed))"
+
+                local freed_human=$(format_bytes "$freed")
+                [ "$freed" -gt 0 ] && print_success "Successfully cleaned workspace: $project_dir (freed: $freed_human)"
+                [ "$freed" -eq 0 ] && print_success "Successfully cleaned workspace: $project_dir (no storage freed)"
                 return 0
             fi
             
@@ -223,7 +245,7 @@ clean_workspace_project() {
                         print_info "Cleaning workspace member: $member"
                         
                         # Try to clean the member, but handle dependency issues gracefully
-                        if clean_cargo_project "$member_path"; then
+                        if clean_cargo_project "$member_path" "bytes_freed_var"; then
                             ((member_cleaned++))
                         else
                             print_warning "Failed to clean workspace member: $member"
@@ -232,8 +254,12 @@ clean_workspace_project() {
                             # Try direct target removal as fallback
                             if [ -d "$member_path/target" ]; then
                                 print_info "Attempting direct target removal for: $member"
+                                local member_target_size=$(get_directory_size_bytes "$member_path/target")
+                                [ -z "$member_target_size" ] && member_target_size=0
                                 if rm -rf "$member_path/target"; then
-                                    print_success "Successfully removed target directory for: $member"
+                                    eval "$bytes_freed_var=\$((\$$bytes_freed_var + member_target_size))"
+                                    local freed_human=$(format_bytes "$member_target_size")
+                                    print_success "Successfully removed target directory for: $member (freed: $freed_human)"
                                     ((member_cleaned++))
                                 else
                                     print_error "Failed to remove target directory for: $member"
@@ -273,8 +299,16 @@ clean_workspace_project() {
 # Function to clean a single cargo project
 clean_cargo_project() {
     local project_dir="$1"
+    local bytes_freed_var="$2"
     print_info "Cleaning Cargo project in: $project_dir"
-    
+
+    # Calculate size before cleaning
+    local target_size_before=0
+    if [ -d "$project_dir/target" ]; then
+        target_size_before=$(get_directory_size_bytes "$project_dir/target")
+        [ -z "$target_size_before" ] && target_size_before=0
+    fi
+
     # Validate the Cargo.toml file first
     if ! validate_cargo_manifest "$project_dir"; then
         print_warning "Invalid Cargo.toml file detected in: $project_dir"
@@ -282,49 +316,83 @@ clean_cargo_project() {
         print_info "Skipping this project as it cannot be cleaned with cargo"
         return 0  # Treat as success since there's nothing to clean
     fi
-    
+
     if cd "$project_dir"; then
         # Try cargo clean first
         if cargo clean 2>/dev/null; then
-            print_success "Successfully cleaned: $project_dir"
+            # Calculate storage freed
+            local target_size_after=0
+            if [ -d "target" ]; then
+                target_size_after=$(du -sb "target" 2>/dev/null | cut -f1)
+                [ -z "$target_size_after" ] && target_size_after=0
+            fi
+            local freed=$((target_size_before - target_size_after))
+            eval "$bytes_freed_var=\$((\$$bytes_freed_var + freed))"
+
+            local freed_human=$(format_bytes "$freed")
+            [ "$freed" -gt 0 ] && print_success "Successfully cleaned: $project_dir (freed: $freed_human)"
+            [ "$freed" -eq 0 ] && print_success "Successfully cleaned: $project_dir (no storage freed)"
             return 0
         else
             # If cargo clean fails, try alternative cleaning methods
             print_warning "Standard cargo clean failed for: $project_dir"
             print_info "Attempting alternative cleaning methods..."
-            
+
             # Method 1: Remove target directory directly
             if [ -d "target" ]; then
                 print_info "Removing target directory directly..."
                 if rm -rf target; then
-                    print_success "Successfully removed target directory: $project_dir"
+                    local freed=$target_size_before
+                    eval "$bytes_freed_var=\$((\$$bytes_freed_var + freed))"
+                    local freed_human=$(format_bytes "$freed")
+                    print_success "Successfully removed target directory: $project_dir (freed: $freed_human)"
                     return 0
                 else
                     print_error "Failed to remove target directory: $project_dir"
                 fi
             fi
-            
+
             # Method 2: Try cargo clean with --offline flag
             print_info "Trying cargo clean with --offline flag..."
             if cargo clean --offline 2>/dev/null; then
-                print_success "Successfully cleaned with --offline: $project_dir"
+                local target_size_after=0
+                if [ -d "target" ]; then
+                    target_size_after=$(du -sb "target" 2>/dev/null | cut -f1)
+                    [ -z "$target_size_after" ] && target_size_after=0
+                fi
+                local freed=$((target_size_before - target_size_after))
+                eval "$bytes_freed_var=\$((\$$bytes_freed_var + freed))"
+
+                local freed_human=$(format_bytes "$freed")
+                [ "$freed" -gt 0 ] && print_success "Successfully cleaned with --offline: $project_dir (freed: $freed_human)"
+                [ "$freed" -eq 0 ] && print_success "Successfully cleaned with --offline: $project_dir (no storage freed)"
                 return 0
             fi
-            
+
             # Method 3: Try cargo clean with --release flag
             print_info "Trying cargo clean with --release flag..."
             if cargo clean --release 2>/dev/null; then
-                print_success "Successfully cleaned with --release: $project_dir"
+                local target_size_after=0
+                if [ -d "target" ]; then
+                    target_size_after=$(du -sb "target" 2>/dev/null | cut -f1)
+                    [ -z "$target_size_after" ] && target_size_after=0
+                fi
+                local freed=$((target_size_before - target_size_after))
+                eval "$bytes_freed_var=\$((\$$bytes_freed_var + freed))"
+
+                local freed_human=$(format_bytes "$freed")
+                [ "$freed" -gt 0 ] && print_success "Successfully cleaned with --release: $project_dir (freed: $freed_human)"
+                [ "$freed" -eq 0 ] && print_success "Successfully cleaned with --release: $project_dir (no storage freed)"
                 return 0
             fi
-            
+
             # If all methods fail, check if it's a workspace dependency issue
             local error_output
             error_output=$(cargo clean 2>&1 || true)
-            
+
             if detect_workspace_issues "$project_dir" "$error_output"; then
                 print_warning "Workspace dependency issue detected in: $project_dir"
-                
+
                 # Check if it's a missing dependency file issue
                 if echo "$error_output" | grep -q "failed to read.*Cargo.toml\|No such file or directory.*Cargo.toml"; then
                     local missing_file
@@ -342,11 +410,14 @@ clean_cargo_project() {
                 else
                     print_info "This is likely due to missing dependencies in workspace root"
                 fi
-                
+
                 if [ -d "target" ]; then
                     print_info "Found target directory, attempting to remove it..."
                     if rm -rf target; then
-                        print_success "Successfully cleaned despite workspace issues: $project_dir"
+                        local freed=$target_size_before
+                        eval "$bytes_freed_var=\$((\$$bytes_freed_var + freed))"
+                        local freed_human=$(format_bytes "$freed")
+                        print_success "Successfully cleaned despite workspace issues: $project_dir (freed: $freed_human)"
                         return 0
                     else
                         print_error "Failed to remove target directory: $project_dir"
@@ -357,7 +428,7 @@ clean_cargo_project() {
                     return 0
                 fi
             fi
-            
+
             print_error "Failed to clean: $project_dir"
             print_info "Error details: $error_output"
             return 1
@@ -368,6 +439,87 @@ clean_cargo_project() {
     fi
 }
 
+# Function to get directory size in bytes (cross-platform)
+get_directory_size_bytes() {
+    local dir="$1"
+    if [ -d "$dir" ]; then
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            # macOS - use stat and calculate
+            find "$dir" -type f -exec stat -f%z {} \; 2>/dev/null | awk '{sum+=$1} END {print sum}'
+        else
+            # Linux - use du with bytes
+            du -sb "$dir" 2>/dev/null | cut -f1
+        fi
+    else
+        echo "0"
+    fi
+}
+
+# Function to convert size to bytes for calculation
+size_to_bytes() {
+    local size="$1"
+    local number=$(echo "$size" | sed 's/[^0-9.]//g')
+    local unit=$(echo "$size" | sed 's/[0-9.]//g')
+
+    case "$unit" in
+        "K"|"KB") echo "$(echo "$number * 1024" | bc -l | cut -d. -f1)" ;;
+        "M"|"MB") echo "$(echo "$number * 1024 * 1024" | bc -l | cut -d. -f1)" ;;
+        "G"|"GB") echo "$(echo "$number * 1024 * 1024 * 1024" | bc -l | cut -d. -f1)" ;;
+        "T"|"TB") echo "$(echo "$number * 1024 * 1024 * 1024 * 1024" | bc -l | cut -d. -f1)" ;;
+        *) echo "$number" ;;
+    esac
+}
+
+# Function to format bytes to human readable
+format_bytes() {
+    local bytes="$1"
+    if [ "$bytes" -eq 0 ] 2>/dev/null; then
+        echo "0 B"
+        return
+    fi
+
+    if command -v bc >/dev/null 2>&1; then
+        if [ "$bytes" -ge 1099511627776 ]; then
+            echo "$(echo "scale=2; $bytes / 1099511627776" | bc) TB"
+        elif [ "$bytes" -ge 1073741824 ]; then
+            echo "$(echo "scale=2; $bytes / 1073741824" | bc) GB"
+        elif [ "$bytes" -ge 1048576 ]; then
+            echo "$(echo "scale=2; $bytes / 1048576" | bc) MB"
+        elif [ "$bytes" -ge 1024 ]; then
+            echo "$(echo "scale=2; $bytes / 1024" | bc) KB"
+        else
+            echo "${bytes} B"
+        fi
+    else
+        # Fallback without bc
+        if [ "$bytes" -ge 1073741824 ]; then
+            echo "$((bytes / 1073741824)) GB"
+        elif [ "$bytes" -ge 1048576 ]; then
+            echo "$((bytes / 1048576)) MB"
+        elif [ "$bytes" -ge 1024 ]; then
+            echo "$((bytes / 1024)) KB"
+        else
+            echo "${bytes} B"
+        fi
+    fi
+}
+
+# Function to get total size of target directories before cleaning
+get_total_cache_size() {
+    local start_dir="$1"
+    local total_bytes=0
+
+    # Find all target directories and calculate their sizes
+    while IFS= read -r -d '' target_dir; do
+        local size_str=$(get_directory_size_bytes "$target_dir")
+        if [ -n "$size_str" ] && [ "$size_str" -gt 0 ] 2>/dev/null; then
+            total_bytes=$((total_bytes + size_str))
+        fi
+    done < <(find "$start_dir" -name "target" -type d -print0)
+
+    echo "$total_bytes"
+}
+
 # Main function
 main() {
     local start_dir="${1:-.}"  # Use current directory if no argument provided
@@ -375,8 +527,15 @@ main() {
     start_dir_abs=$(realpath "$start_dir")  # Store absolute path
     local cleaned_count=0
     local failed_count=0
-    
+    local total_bytes_freed=0
+
+    # Calculate initial cache size
+    print_info "Calculating initial cache size..."
+    local initial_cache_size=$(get_total_cache_size "$start_dir_abs")
+    local initial_cache_human=$(format_bytes "$initial_cache_size")
+
     print_info "Starting recursive cargo clean from: $start_dir_abs"
+    print_info "Initial cache size: $initial_cache_human"
     print_info "Searching for Cargo.toml files..."
     
     # Find all directories containing Cargo.toml files
@@ -385,7 +544,7 @@ main() {
         
         # Check if this is a workspace root
         if [ -f "$project_dir/Cargo.toml" ] && grep -q "^\[workspace\]" "$project_dir/Cargo.toml"; then
-            if clean_workspace_project "$project_dir"; then
+            if clean_workspace_project "$project_dir" "total_bytes_freed"; then
                 ((cleaned_count++))
             else
                 ((failed_count++))
@@ -403,7 +562,7 @@ main() {
             done
             
             if [ "$is_workspace_member" = false ]; then
-                if clean_cargo_project "$project_dir"; then
+                if clean_cargo_project "$project_dir" "total_bytes_freed"; then
                     ((cleaned_count++))
                 else
                     ((failed_count++))
@@ -425,7 +584,14 @@ main() {
     echo
     print_info "=== SUMMARY ==="
     print_success "Successfully cleaned: $cleaned_count projects"
-    
+
+    if [ "$total_bytes_freed" -gt 0 ]; then
+        local total_freed_human=$(format_bytes "$total_bytes_freed")
+        print_success "Total storage freed: $total_freed_human"
+    else
+        print_info "No storage was freed (projects were already clean or no cache found)"
+    fi
+
     if [ $failed_count -gt 0 ]; then
         print_error "Failed to clean: $failed_count projects"
         exit 1
